@@ -9,7 +9,7 @@ from mkosi.config import Architecture, Config
 from mkosi.context import Context
 from mkosi.distributions import Distribution, DistributionInstaller, PackageType
 from mkosi.installer import PackageManager
-from mkosi.installer.apt import Apt
+from mkosi.installer.apt import Apt, find_apt_gpgkey
 from mkosi.log import die
 from mkosi.run import run
 from mkosi.sandbox import Mount
@@ -58,7 +58,8 @@ class Installer(DistributionInstaller):
             return
 
         mirror = context.config.mirror or "http://deb.debian.org/debian"
-        signedby = Path("/usr/share/keyrings/debian-archive-keyring.gpg")
+        # signedby = Path("/usr/share/keyrings/debian-archive-keyring.gpg")
+        signedby = find_apt_gpgkey(context, key="debian-archive-keyring.gpg")
 
         yield Apt.Repository(
             types=types,

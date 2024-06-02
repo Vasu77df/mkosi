@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: LGPL-2.1+
-
 from collections.abc import Iterable
 from pathlib import Path
+from time import sleep
 
 from mkosi.context import Context
 from mkosi.distributions import Distribution, debian
-from mkosi.installer.apt import Apt
+from mkosi.installer.apt import Apt, find_apt_gpgkey
 from mkosi.util import listify
 
 
@@ -47,7 +47,11 @@ class Installer(debian.Installer):
         else:
             mirror = context.config.mirror or "http://ports.ubuntu.com"
 
-        signedby = Path("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
+        # signedby = Path("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
+
+        signedby = Path(find_apt_gpgkey(context, key="ubuntu-archive-keyring.gpg"))
+
+        print(f"This is signedby {signedby}")
 
         yield Apt.Repository(
             types=types,

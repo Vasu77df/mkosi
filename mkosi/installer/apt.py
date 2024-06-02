@@ -15,6 +15,24 @@ from mkosi.sandbox import Mount, apivfs_cmd
 from mkosi.types import _FILE, CompletedProcess, PathString
 from mkosi.util import umask
 
+def find_apt_gpgkey(context: Context, key: str) -> Optional[str]:
+    root = context.config.tools() if context.config.tools_tree_certificates else Path("/")
+
+    if gpgpath := next((root / "usr/share/keyrings").rglob(key), None):
+        print(gpgpath)
+        return (Path("/") / gpgpath.relative_to(root))
+    
+    if gpgpath := next(Path(context.pkgmngr / "usr/share/keyrings").rglob(key), None):
+        print(gpgpath)
+        print((Path("/") / gpgpath.relative_to(context.pkgmngr)))
+        print(gpgpath.relative_to(context.pkgmngr))
+        return (context.pkgmngr/ gpgpath.relative_to(context.pkgmngr))
+
+    if gpgpath := next(Path(context.pkgmngr / "etc/apt/keyrings").rglob(key), None):
+        return (Path("/") / gpgpath.relative_to(context.pkgmngr))
+
+    return None
+
 
 class Apt(PackageManager):
     class Repository(NamedTuple):
