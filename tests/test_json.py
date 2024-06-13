@@ -216,6 +216,9 @@ def test_config() -> None:
             "PostInstallationScripts": [
                 "/bar/qux"
             ],
+            "PostOutputScripts": [
+                "/foo/src"
+            ],
             "PrepareScripts": [
                 "/run/foo"
             ],
@@ -332,6 +335,7 @@ def test_config() -> None:
             "ToolsTreeRepositories": [
                 "abc"
             ],
+            "UnifiedKernelImageFormat": "myuki",
             "UnifiedKernelImages": "auto",
             "UnitProperties": [
                 "PROPERTY=VALUE"
@@ -430,6 +434,7 @@ def test_config() -> None:
         packages=[],
         passphrase=None,
         postinst_scripts=[Path("/bar/qux")],
+        postoutput_scripts=[Path("/foo/src")],
         prepare_scripts=[Path("/run/foo")],
         profile="profile",
         proxy_client_certificate=Path("/my/client/cert"),
@@ -495,6 +500,7 @@ def test_config() -> None:
         tools_tree_packages=[],
         tools_tree_release=None,
         tools_tree_repositories=["abc"],
+        unified_kernel_image_format="myuki",
         unified_kernel_images=ConfigFeature.auto,
         unit_properties=["PROPERTY=VALUE"],
         use_subvolumes=ConfigFeature.auto,

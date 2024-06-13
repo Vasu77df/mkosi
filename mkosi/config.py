@@ -48,7 +48,7 @@ from mkosi.util import (
 )
 from mkosi.versioncomp import GenericVersion
 
-__version__ = "23~devel"
+__version__ = "23.1"
 
 ConfigParseCallback = Callable[[Optional[str], Optional[Any]], Any]
 ConfigMatchCallback = Callable[[str, Any], bool]
@@ -74,6 +74,7 @@ class Verb(StrEnum):
     journalctl    = enum.auto()
     coredumpctl   = enum.auto()
     burn          = enum.auto()
+    dependencies  = enum.auto()
 
     def supports_cmdline(self) -> bool:
         return self in (
@@ -675,10 +676,7 @@ def config_parse_compress_level(value: Optional[str], old: Optional[int]) -> Opt
 
 def config_default_compression(namespace: argparse.Namespace) -> Compression:
     if namespace.output_format in (OutputFormat.tar, OutputFormat.cpio, OutputFormat.uki, OutputFormat.esp):
-        if (
-            (namespace.distribution.is_centos_variant() and int(namespace.release) <= 8) or
-            (namespace.distribution == Distribution.ubuntu and namespace.release == "focal")
-        ):
+        if namespace.distribution == Distribution.ubuntu and namespace.release == "focal":
             return Compression.xz
         else:
             return Compression.zstd
@@ -950,16 +948,17 @@ def is_valid_filename(s: str) -> bool:
     return not (s == "." or s == ".." or "/" in s)
 
 
-def config_parse_output(value: Optional[str], old: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
+def config_make_filename_parser(hint: str) -> ConfigParseCallback:
+    def config_parse_filename(value: Optional[str], old: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
 
-    if not is_valid_filename(value):
-        die(f"{value!r} is not a valid filename.",
-            hint="Output= or --output= requires a filename with no path components. "
-                 "Use OutputDirectory= or --output-dir= to configure the output directory.")
+        if not is_valid_filename(value):
+            die(f"{value!r} is not a valid filename.", hint=hint)
 
-    return value
+        return value
+
+    return config_parse_filename
 
 
 def match_path_exists(value: str) -> bool:
@@ -1418,6 +1417,7 @@ class Config:
     build_scripts: list[Path]
     postinst_scripts: list[Path]
     finalize_scripts: list[Path]
+    postoutput_scripts: list[Path]
     clean_scripts: list[Path]
     build_sources: list[ConfigTree]
     build_sources_ephemeral: bool
@@ -1431,6 +1431,7 @@ class Config:
     bios_bootloader: BiosBootloader
     shim_bootloader: ShimBootloader
     unified_kernel_images: ConfigFeature
+    unified_kernel_image_format: str
     initrds: list[Path]
     initrd_packages: list[str]
     initrd_volatile_packages: list[str]
@@ -1971,7 +1972,10 @@ SETTINGS = (
         metavar="NAME",
         section="Output",
         specifier="o",
-        parse=config_parse_output,
+        parse=config_make_filename_parser(
+            "Output= or --output= requires a filename with no path components. "
+            "Use OutputDirectory= or --output-dir= to configure the output directory."
+        ),
         default_factory=config_default_output,
         default_factory_depends=("image_id", "image_version"),
         help="Output name",
@@ -2288,6 +2292,17 @@ SETTINGS = (
         compat_names=("FinalizeScript",),
     ),
     ConfigSetting(
+        dest="postoutput_scripts",
+        long="--postoutput-script",
+        metavar="PATH",
+        name="PostOutputScripts",
+        section="Content",
+        parse=config_make_list_parser(delimiter=",", parse=make_path_parser()),
+        paths=("mkosi.postoutput",),
+        path_default=False,
+        help="Output postprocessing script to run outside image",
+    ),
+    ConfigSetting(
         dest="build_sources",
         metavar="PATH",
         section="Content",
@@ -2380,6 +2395,19 @@ SETTINGS = (
         section="Content",
         parse=config_parse_feature,
         help="Specify whether to use UKIs with grub/systemd-boot in UEFI mode",
+    ),
+    ConfigSetting(
+        dest="unified_kernel_image_format",
+        section="Content",
+        parse=config_make_filename_parser(
+            "UnifiedKernelImageFormat= or --unified-kernel-image-format= "
+            "requires a filename with no path components."
+        ),
+        # The default value is set in `__init__.py` in `install_uki`.
+        # `None` is used to determin if the roothash and boot count format
+        # should be appended to the filename if they are found.
+        #default=
+        help="Specify the format used for the UKI filename",
     ),
     ConfigSetting(
         dest="initrds",
@@ -2775,6 +2803,8 @@ SETTINGS = (
         parse=config_make_path_parser(required=False, constants=("default",)),
         paths=("mkosi.tools",),
         help="Look up programs to execute inside the given tree",
+        nargs="?",
+        const="default",
     ),
     ConfigSetting(
         dest="tools_tree_distribution",
@@ -3342,6 +3372,7 @@ def parse_config(argv: Sequence[str] = (), *, resources: Path = Path("/")) -> tu
                         *config.build_scripts,
                         *config.postinst_scripts,
                         *config.finalize_scripts,
+                        *config.postoutput_scripts,
                     )
 
                 with chdir(path if path.is_dir() else Path.cwd()):
@@ -3838,13 +3869,6 @@ def load_config(args: Args, config: argparse.Namespace) -> Config:
             die("UEFI SecureBoot enabled, private key was found, but not the certificate.",
                 hint="Consider placing it in mkosi.crt")
 
-    if config.repositories and not (
-        config.distribution.is_dnf_distribution() or
-        config.distribution.is_apt_distribution() or
-        config.distribution == Distribution.arch
-    ):
-        die("Sorry, the --repositories option is only supported on pacman, dnf and apt based distributions")
-
     if config.overlay and not config.base_trees:
         die("--overlay can only be used with --base-tree")
 
@@ -3974,6 +3998,7 @@ def summary(config: Config) -> str:
                       Build Scripts: {line_join_list(config.build_scripts)}
                 Postinstall Scripts: {line_join_list(config.postinst_scripts)}
                    Finalize Scripts: {line_join_list(config.finalize_scripts)}
+                 Postoutput Scripts: {line_join_list(config.postoutput_scripts)}
                       Build Sources: {line_join_list(config.build_sources)}
             Build Sources Ephemeral: {yes_no(config.build_sources_ephemeral)}
                  Script Environment: {line_join_list(env)}
@@ -3985,6 +4010,8 @@ def summary(config: Config) -> str:
                          Bootloader: {config.bootloader}
                     BIOS Bootloader: {config.bios_bootloader}
                     Shim Bootloader: {config.shim_bootloader}
+              Unified Kernel Images: {config.unified_kernel_images}
+        Unified Kernel Image Format: {config.unified_kernel_image_format}
                             Initrds: {line_join_list(config.initrds)}
                     Initrd Packages: {line_join_list(config.initrd_packages)}
            Initrd Volatile Packages: {line_join_list(config.initrd_volatile_packages)}

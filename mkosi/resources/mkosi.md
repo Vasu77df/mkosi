@@ -36,6 +36,8 @@ mkosi — Build Bespoke OS Images
 
 `mkosi [options…] documentation`
 
+`mkosi [options…] dependencies`
+
 `mkosi [options…] help`
 
 # DESCRIPTION
@@ -105,10 +107,17 @@ The following command line verbs are known:
     Any arguments specified after the `journalctl` verb are appended to the
     `journalctl` invocation.
 
+    If `ForwardJournal=` is specified, this verb will operate on the
+    forwarded journal instead of the journal inside the image.
+
 `coredumpctl`
 :   Uses `coredumpctl` to look for coredumps inside the image.
     Any arguments specified after the `coredumpctl` verb are appended to the
     `coredumpctl` invocation.
+
+    If `ForwardJournal=` is specified, this verb will operate on the
+    forwarded journal instead of the image. Note that this requires
+    configuring systemd-coredump to store coredumps in the journal.
 
 `clean`
 :   Remove build artifacts generated on a previous build. If combined
@@ -152,6 +161,18 @@ The following command line verbs are known:
     search path for man pages. The man page can be generated from the
     markdown file `mkosi/resources/mkosi.md` e.g via
     `pandoc -t man -s -o mkosi.1 mkosi.md`.
+
+`dependencies`
+:   Output the list of packages required by mkosi to build and boot
+    images.
+
+    This list can be piped directly to a package manager to install the
+    packages. For example, if the host system uses the dnf package
+    manager, the packages could be installed as follows:
+
+    ```sh
+    mkosi dependencies | xargs -d '\n' dnf install
+    ```
 
 `help`
 :   This verb is equivalent to the `--help` switch documented below: it
@@ -298,7 +319,7 @@ configuration files that can still be overridden by specifying the
 setting explicitly via the CLI.
 
 To conditionally include configuration files, the `[Match]` section can
-be used. A `[Match]` section consists of invididual conditions.
+be used. A `[Match]` section consists of individual conditions.
 Conditions can use a pipe symbol (`|`) after the equals sign (`…=|…`),
 which causes the condition to become a triggering condition. The config
 file will be included if the logical AND of all non-triggering
@@ -857,6 +878,11 @@ boolean argument: either `1`, `yes`, or `true` to enable, or `0`, `no`,
     the finalize scripts for this image. See the **Scripts** section for more
     information.
 
+`PostOutputScripts=`, `--postoutput-script`
+:   Takes a comma-separated list of paths to executables that are used as
+    the post output scripts for this image. See the **Scripts** section for more
+    information.
+
 `BuildSources=`, `--build-sources=`
 :   Takes a comma separated list of colon separated path pairs. The first
     path of each pair refers to a directory to mount from the host. The
@@ -990,6 +1016,25 @@ boolean argument: either `1`, `yes`, or `true` to enable, or `0`, `no`,
     Otherwise Type 1 entries as defined by the Boot Loader Specification
     will be used instead. If disabled, Type 1 entries will always be used.
 
+`UnifiedKernelImageFormat=`, `--unified-kernel-image-format=`
+:   Takes a filename without any path components to specify the format that
+    unified kernel images should be installed as. This may include both the
+    regular specifiers (see **Specifiers**) and special delayed specifiers, that
+    are expanded during the installation of the files, which are described below.
+    The default format for this parameter is `&e-&k` with `-&h` being appended
+    if `roothash=` or `usrhash=` is found on the kernel command line and `+&c`
+    if `/etc/kernel/tries` is found in the image.
+
+    The following specifiers may be used:
+
+    | Specifier | Value                                              |
+    |-----------|----------------------------------------------------|
+    | `&&`      | `&` character                                      |
+    | `&e`      | Entry Token                                        |
+    | `&k`      | Kernel version                                     |
+    | `&h`      | `roothash=` or `usrhash=` value of kernel argument |
+    | `&c`      | Number of tries used for boot attempt counting     |
+
 `Initrds=`, `--initrd`
 :   Use user-provided initrd(s). Takes a comma separated list of paths to initrd
     files. This option may be used multiple times in which case the initrd lists
@@ -1021,20 +1066,21 @@ boolean argument: either `1`, `yes`, or `true` to enable, or `0`, `no`,
     relative to the `/usr/lib/modules/<kver>/kernel` directory. mkosi checks for a match anywhere in the module
     path (e.g. `i915` will match against `drivers/gpu/drm/i915.ko`). All modules that match any of the
     specified patterns are included in the image. All module and firmware dependencies of the matched modules
-    are included in the image as well. This setting takes priority over `KernelModulesExclude=` and only makes
+    are included in the image as well.
+
+    If the special value `default` is used, the default kernel modules
+    defined in the `mkosi-initrd` configuration are included as well.
+
+    If the special value `host` is used, the currently loaded modules on
+    the host system are included as well.
+
+    This setting takes priority over `KernelModulesExclude=` and only makes
     sense when used in combination with it because all kernel modules are included in the image by default.
 
 `KernelModulesExclude=`, `--kernel-modules-exclude=`
 :   Takes a list of regex patterns that specify modules to exclude from the image. Behaves the same as
     `KernelModulesInclude=` except that all modules that match any of the specified patterns are excluded from
     the image.
-
-`KernelModulesIncludeHost=`, `--kernel-modules-include-host=`
-:   Takes a boolean. Specifies whether to include the currently loaded
-    modules on the host system in the image. This setting takes priority
-    over `KernelModulesExclude=` and only makes sense when used in
-    combination with it because all kernel modules are included in the
-    image by default.
 
 `KernelModulesInitrd=`, `--kernel-modules-initrd=`
 :   Enable/Disable generation of the kernel modules initrd when building a bootable image. Enabled by default.
@@ -1048,9 +1094,6 @@ boolean argument: either `1`, `yes`, or `true` to enable, or `0`, `no`,
 
 `KernelModulesInitrdExclude=`, `--kernel-modules-initrd-exclude=`
 :   Like `KernelModulesExclude=`, but applies to the kernel modules included in the kernel modules initrd.
-
-`KernelModulesInitrdIncludeHost=`, `--kernel-modules-initrd-include-host=`
-:   Like `KernelModulesIncludeHost=`, but applies to the kernel modules included in the kernel modules initrd.
 
 `Locale=`, `--locale=`, `LocaleMessages=`, `--locale-messages=`, `Keymap=`, `--keymap=`, `Timezone=`, `--timezone=`, `Hostname=`, `--hostname=`, `RootShell=`, `--root-shell=`
 :   The settings `Locale=`, `--locale=`, `LocaleMessages=`, `--locale-messages=`,
@@ -1471,7 +1514,7 @@ boolean argument: either `1`, `yes`, or `true` to enable, or `0`, `no`,
     | `tar`                   | ✓      | ✓      | ✓      | ✓      | ✓    | ✓        |
     | `ubuntu-keyring`        | ✓      | ✓      | ✓      | ✓      | ✓    |          |
     | `util-linux`            | ✓      | ✓      | ✓      | ✓      | ✓    | ✓        |
-    | `virtiofsd`             | ✓      | ✓      |        |        | ✓    | ✓        |
+    | `virtiofsd`             | ✓      | ✓      | ✓      | ✓      | ✓    | ✓        |
     | `virt-firmware`         | ✓      | ✓      |        |        | ✓    |          |
     | `xfsprogs`              | ✓      | ✓      | ✓      | ✓      | ✓    | ✓        |
     | `xz`                    | ✓      | ✓      | ✓      | ✓      | ✓    | ✓        |
@@ -1913,6 +1956,7 @@ Then, for each image, we execute the following steps:
 1. Run finalize scripts (`mkosi.finalize`)
 1. Generate unified kernel image if configured to do so
 1. Generate final output format
+1. Run post-output scripts (`mkosi.postoutput`)
 
 # Scripts
 
@@ -1978,6 +2022,11 @@ current working directory. The following scripts are supported:
 
 * If **`mkosi.finalize`** (`FinalizeScripts=`) exists, it is executed as
   the last step of preparing an image.
+
+* If **`mkosi.postoutput`** (`PostOutputScripts=`) exists, it is executed right
+  after all the output files have been generated, before they are finally
+  moved into the output directory. This can be used to generate additional or
+  alternative outputs, e.g. `SHA256FILES` or SBOM manifests.
 
 * If **`mkosi.clean`** (`CleanScripts=`) exists, it is executed right
   after the outputs of a previous build have been cleaned up. A clean
@@ -2096,33 +2145,33 @@ Scripts executed by mkosi receive the following environment variables:
 
 Consult this table for which script receives which environment variables:
 
-| Variable            | `configure` | `sync` | `prepare` | `build` | `postinst` | `finalize` | `clean` |
-|---------------------|:-----------:|:------:|:---------:|:-------:|:----------:|:----------:|:-------:|
-| `ARCHITECTURE`      | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `QEMU_ARCHITECTURE` | ✓           |        |           |         |            |            |         |
-| `DISTRIBUTION`      | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `RELEASE`           | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `PROFILE`           | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `CACHED`            |             | ✓      |           |         |            |            |         |
-| `CHROOT_SCRIPT`     |             |        | ✓         | ✓       | ✓          | ✓          |         |
-| `SRCDIR`            | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `CHROOT_SRCDIR`     |             |        | ✓         | ✓       | ✓          | ✓          |         |
-| `BUILDDIR`          |             |        |           | ✓       |            |            |         |
-| `CHROOT_BUILDDIR`   |             |        |           | ✓       |            |            |         |
-| `DESTDIR`           |             |        |           | ✓       |            |            |         |
-| `CHROOT_DESTDIR`    |             |        |           | ✓       |            |            |         |
-| `OUTPUTDIR`         |             |        |           | ✓       | ✓          | ✓          | ✓       |
-| `CHROOT_OUTPUTDIR`  |             |        |           | ✓       | ✓          | ✓          |         |
-| `BUILDROOT`         |             |        | ✓         | ✓       | ✓          | ✓          |         |
-| `PACKAGEDIR`        |             |        | ✓         | ✓       | ✓          | ✓          |         |
-| `ARTIFACTDIR`       |             |        | ✓         | ✓       | ✓          | ✓          |         |
-| `WITH_DOCS`         |             |        | ✓         | ✓       |            |            |         |
-| `WITH_TESTS`        |             |        | ✓         | ✓       |            |            |         |
-| `WITH_NETWORK`      |             |        | ✓         | ✓       | ✓          | ✓          |         |
-| `SOURCE_DATE_EPOCH` |             |        | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `MKOSI_UID`         | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `MKOSI_GID`         | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
-| `MKOSI_CONFIG`      |             | ✓      | ✓         | ✓       | ✓          | ✓          | ✓       |
+| Variable            | `configure` | `sync` | `prepare` | `build` | `postinst` | `finalize` | `postoutput` | `clean` |
+|---------------------|:-----------:|:------:|:---------:|:-------:|:----------:|:----------:|:------------:|:-------:|
+| `ARCHITECTURE`      | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓            | ✓       |
+| `QEMU_ARCHITECTURE` | ✓           |        |           |         |            |            |              |         |
+| `DISTRIBUTION`      | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓            | ✓       |
+| `RELEASE`           | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓            | ✓       |
+| `PROFILE`           | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          |              | ✓       |
+| `CACHED`            |             | ✓      |           |         |            |            |              |         |
+| `CHROOT_SCRIPT`     |             |        | ✓         | ✓       | ✓          | ✓          |              |         |
+| `SRCDIR`            | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓            | ✓       |
+| `CHROOT_SRCDIR`     |             |        | ✓         | ✓       | ✓          | ✓          |              |         |
+| `BUILDDIR`          |             |        |           | ✓       |            |            |              |         |
+| `CHROOT_BUILDDIR`   |             |        |           | ✓       |            |            |              |         |
+| `DESTDIR`           |             |        |           | ✓       |            |            |              |         |
+| `CHROOT_DESTDIR`    |             |        |           | ✓       |            |            |              |         |
+| `OUTPUTDIR`         |             |        |           | ✓       | ✓          | ✓          | ✓            | ✓       |
+| `CHROOT_OUTPUTDIR`  |             |        |           | ✓       | ✓          | ✓          |              |         |
+| `BUILDROOT`         |             |        | ✓         | ✓       | ✓          | ✓          |              |         |
+| `PACKAGEDIR`        |             |        | ✓         | ✓       | ✓          | ✓          |              |         |
+| `ARTIFACTDIR`       |             |        | ✓         | ✓       | ✓          | ✓          |              |         |
+| `WITH_DOCS`         |             |        | ✓         | ✓       |            |            |              |         |
+| `WITH_TESTS`        |             |        | ✓         | ✓       |            |            |              |         |
+| `WITH_NETWORK`      |             |        | ✓         | ✓       | ✓          | ✓          |              |         |
+| `SOURCE_DATE_EPOCH` |             |        | ✓         | ✓       | ✓          | ✓          |              | ✓       |
+| `MKOSI_UID`         | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓            | ✓       |
+| `MKOSI_GID`         | ✓           | ✓      | ✓         | ✓       | ✓          | ✓          | ✓            | ✓       |
+| `MKOSI_CONFIG`      |             | ✓      | ✓         | ✓       | ✓          | ✓          | ✓            | ✓       |
 
 Additionally, when a script is executed, a few scripts are made
 available via `$PATH` to simplify common usecases.
@@ -2148,12 +2197,12 @@ available via `$PATH` to simplify common usecases.
   To execute the entire script inside the image, add a ".chroot" suffix
   to the name (`mkosi.build.chroot` instead of `mkosi.build`, etc.).
 
-* For all of the supported package managers except portage (`dnf`,
-  `rpm`, `apt`, `pacman`, `zypper`), scripts of the same name are put
-  into `$PATH` that make sure these commands operate on the image's root
-  directory with the configuration supplied by the user instead of on
-  the host system. This means that from a script, you can do e.g. `dnf
-  install vim` to install vim into the image.
+* For all of the supported package managers (`dnf`, `rpm`, `apt`, `dpkg`,
+  `pacman`, `zypper`), scripts of the same name are put into `$PATH`
+  that make sure these commands operate on the image's root directory
+  with the configuration supplied by the user instead of on the host
+  system. This means that from a script, you can do e.g.
+  `dnf install vim` to install vim into the image.
 
   Additionally, `mkosi-install`, `mkosi-reinstall`, `mkosi-upgrade` and
   `mkosi-remove` will invoke the corresponding operation of the package

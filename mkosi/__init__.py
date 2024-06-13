@@ -56,7 +56,7 @@ from mkosi.config import (
 from mkosi.context import Context
 from mkosi.distributions import Distribution
 from mkosi.installer import clean_package_manager_metadata
-from mkosi.kmod import gen_required_kernel_modules, process_kernel_modules
+from mkosi.kmod import gen_required_kernel_modules, loaded_modules, process_kernel_modules
 from mkosi.log import ARG_DEBUG, complete_step, die, log_notice, log_step
 from mkosi.manifest import Manifest
 from mkosi.mounts import finalize_crypto_mounts, finalize_source_mounts, mount_overlay
@@ -827,6 +827,47 @@ def run_finalize_scripts(context: Context) -> None:
                         scripts=hd,
                         extra=chroot if script.suffix == ".chroot" else [],
                     ),
+                )
+
+
+def run_postoutput_scripts(context: Context) -> None:
+    if not context.config.postoutput_scripts:
+        return
+
+    env = dict(
+        DISTRIBUTION=str(context.config.distribution),
+        RELEASE=context.config.release,
+        ARCHITECTURE=str(context.config.architecture),
+        SRCDIR="/work/src",
+        OUTPUTDIR="/work/out",
+        MKOSI_UID=str(INVOKING_USER.uid),
+        MKOSI_GID=str(INVOKING_USER.gid),
+        MKOSI_CONFIG="/work/config.json",
+    )
+
+    if context.config.profile:
+        env["PROFILE"] = context.config.profile
+
+    with (
+        finalize_source_mounts(context.config, ephemeral=context.config.build_sources_ephemeral) as sources,
+        finalize_config_json(context.config) as json,
+    ):
+        for script in context.config.postoutput_scripts:
+            with complete_step(f"Running post-output script {script}…"):
+                run(
+                    ["/work/postoutput"],
+                    env=env | context.config.environment,
+                    sandbox=context.config.sandbox(
+                        binary=None,
+                        mounts=[
+                            *sources,
+                            Mount(script, "/work/postoutput", ro=True),
+                            Mount(json, "/work/config.json", ro=True),
+                            Mount(context.staging, "/work/out"),
+                        ],
+                        options=["--dir", "/work/src", "--chdir", "/work/src", "--dir", "/work/out"]
+                    ),
+                    stdin=sys.stdin,
                 )
 
 
@@ -1897,6 +1938,17 @@ def build_microcode_initrd(context: Context) -> list[Path]:
     return [microcode]
 
 
+def finalize_kernel_modules_include(context: Context, *, include: Sequence[str], host: bool) -> set[str]:
+    final = {i for i in include if i not in ("default", "host")}
+    if "default" in include:
+        initrd = finalize_default_initrd(context.args, context.config, resources=context.resources)
+        final.update(initrd.kernel_modules_include)
+    if host or "host" in include:
+        final.update(loaded_modules())
+
+    return final
+
+
 def build_kernel_modules_initrd(context: Context, kver: str) -> Path:
     kmods = context.workspace / f"kernel-modules-{kver}.initrd"
     if kmods.exists():
@@ -1906,9 +1958,12 @@ def build_kernel_modules_initrd(context: Context, kver: str) -> Path:
         context.root, kmods,
         files=gen_required_kernel_modules(
             context.root, kver,
-            include=context.config.kernel_modules_initrd_include,
+            include=finalize_kernel_modules_include(
+                context,
+                include=context.config.kernel_modules_initrd_include,
+                host=context.config.kernel_modules_initrd_include_host,
+            ),
             exclude=context.config.kernel_modules_initrd_exclude,
-            host=context.config.kernel_modules_initrd_include_host,
             sandbox=context.sandbox,
         ),
         sandbox=context.sandbox,
@@ -1963,24 +2018,30 @@ def extract_pe_section(context: Context, binary: Path, section: str, output: Pat
     # pefile from the tools tree if one is used.
 
     # TODO: Use ignore_padding=True instead of length once we can depend on a newer pefile.
+    # TODO: Drop KeyError logic once we drop support for Ubuntu Jammy and sdmagic will always be available.
     pefile = textwrap.dedent(
         f"""\
         import pefile
         import sys
         from pathlib import Path
         pe = pefile.PE("{binary}", fast_load=True)
-        section = {{s.Name.decode().strip("\\0"): s for s in pe.sections}}["{section}"]
+        section = {{s.Name.decode().strip("\\0"): s for s in pe.sections}}.get("{section}")
+        if not section:
+            sys.exit(67)
         sys.stdout.buffer.write(section.get_data(length=section.Misc_VirtualSize))
         """
     )
 
     with open(output, "wb") as f:
-        run(
+        result = run(
             [python_binary(context.config)],
             input=pefile,
             stdout=f,
-            sandbox=context.sandbox(binary=python_binary(context.config), mounts=[Mount(binary, binary, ro=True)])
+            sandbox=context.sandbox(binary=python_binary(context.config), mounts=[Mount(binary, binary, ro=True)]),
+            success_exit_status=(0, 67),
         )
+        if result.returncode == 67:
+            raise KeyError(f"{section} section not found in {binary}")
 
     return output
 
@@ -2089,7 +2150,8 @@ def build_uki(
         # new .ucode section support?
         if (
             systemd_tool_version(context.config, ukify) >= "256~devel" and
-            systemd_stub_version(context, stub) >= "256~devel"
+            (version := systemd_stub_version(context, stub)) and
+            version >= "256~devel"
         ):
             for microcode in microcodes:
                 cmd += ["--microcode", microcode]
@@ -2148,12 +2210,17 @@ def systemd_stub_binary(context: Context) -> Path:
     return stub
 
 
-def systemd_stub_version(context: Context, stub: Path) -> GenericVersion:
-    sdmagic = extract_pe_section(context, stub, ".sdmagic", context.workspace / "sdmagic")
+def systemd_stub_version(context: Context, stub: Path) -> Optional[GenericVersion]:
+    try:
+        sdmagic = extract_pe_section(context, stub, ".sdmagic", context.workspace / "sdmagic")
+    except KeyError:
+        return None
+
     sdmagic_text = sdmagic.read_text()
-    if version := re.match(r"#### LoaderInfo: systemd-stub (?P<version>[.~^a-zA-Z0-9-+]+) ####", sdmagic_text):
-        return GenericVersion(version.group("version"))
-    die(f"Unable to determine systemd-stub version, found {sdmagic_text!r}")
+    if not (version := re.match(r"#### LoaderInfo: systemd-stub (?P<version>[.~^a-zA-Z0-9-+]+) ####", sdmagic_text)):
+        die(f"Unable to determine systemd-stub version, found {sdmagic_text!r}")
+
+    return GenericVersion(version.group("version"))
 
 
 def want_uki(context: Context) -> bool:
@@ -2299,12 +2366,50 @@ def install_type1(
             f.write("fi\n")
 
 
+def expand_kernel_specifiers(text: str, kver: str, token: str, roothash: str, boot_count: str) -> str:
+    specifiers = {
+        "&": "&",
+        "e": token,
+        "k": kver,
+        "h": roothash,
+        "c": boot_count
+    }
+
+    def replacer(match: re.Match[str]) -> str:
+        m = match.group("specifier")
+        if specifier := specifiers.get(m):
+            return specifier
+
+        logging.warning(f"Unknown specifier '&{m}' found in {text}, ignoring")
+        return ""
+
+    return re.sub(r"&(?P<specifier>[&a-zA-Z])", replacer, text)
+
+
 def install_uki(context: Context, kver: str, kimg: Path, token: str, partitions: Sequence[Partition]) -> None:
-    roothash = finalize_roothash(partitions)
+    bootloader_entry_format = context.config.unified_kernel_image_format or "&e-&k"
+
+    roothash_value = ""
+    if roothash := finalize_roothash(partitions):
+        roothash_value = roothash.partition("=")[2]
+
+        if not context.config.unified_kernel_image_format:
+            bootloader_entry_format += "-&h"
 
     boot_count = ""
     if (context.root / "etc/kernel/tries").exists():
-        boot_count = f'+{(context.root / "etc/kernel/tries").read_text().strip()}'
+        boot_count = (context.root / "etc/kernel/tries").read_text().strip()
+
+        if not context.config.unified_kernel_image_format:
+            bootloader_entry_format += "+&c"
+
+    bootloader_entry = expand_kernel_specifiers(
+        bootloader_entry_format,
+        kver=kver,
+        token=token,
+        roothash=roothash_value,
+        boot_count=boot_count,
+    )
 
     if context.config.bootloader == Bootloader.uki:
         if context.config.shim_bootloader != ShimBootloader.none:
@@ -2312,11 +2417,7 @@ def install_uki(context: Context, kver: str, kimg: Path, token: str, partitions:
         else:
             boot_binary = context.root / efi_boot_binary(context)
     else:
-        if roothash:
-            _, _, h = roothash.partition("=")
-            boot_binary = context.root / f"boot/EFI/Linux/{token}-{kver}-{h}{boot_count}.efi"
-        else:
-            boot_binary = context.root / f"boot/EFI/Linux/{token}-{kver}{boot_count}.efi"
+        boot_binary = context.root / f"boot/EFI/Linux/{bootloader_entry}.efi"
 
     # Make sure the parent directory where we'll be writing the UKI exists.
     with umask(~0o700):
@@ -2684,6 +2785,7 @@ def check_inputs(config: Config) -> None:
         config.build_scripts,
         config.postinst_scripts,
         config.finalize_scripts,
+        config.postoutput_scripts,
     ):
         if not os.access(script, os.X_OK):
             die(f"{script} is not executable")
@@ -2888,9 +2990,12 @@ def run_depmod(context: Context, *, cache: bool = False) -> None:
         if not cache:
             process_kernel_modules(
                 context.root, kver,
-                include=context.config.kernel_modules_include,
+                include=finalize_kernel_modules_include(
+                    context,
+                    include=context.config.kernel_modules_include,
+                    host=context.config.kernel_modules_include_host,
+                ),
                 exclude=context.config.kernel_modules_exclude,
-                host=context.config.kernel_modules_include_host,
                 sandbox=context.sandbox,
             )
 
@@ -3790,6 +3895,7 @@ def build_image(context: Context) -> None:
         output_base.unlink(missing_ok=True)
         output_base.symlink_to(context.config.output_with_compression)
 
+    run_postoutput_scripts(context)
     finalize_staging(context)
 
     print_output_size(context.config.output_dir_or_cwd() / context.config.output_with_compression)
@@ -3932,6 +4038,7 @@ def run_shell(args: Args, config: Config) -> None:
                     "--no-pager",
                     "--dry-run=no",
                     "--offline=no",
+                    "--pretty=no",
                     fname,
                 ],
                 stdin=sys.stdin,
@@ -4029,12 +4136,13 @@ def run_shell(args: Args, config: Config) -> None:
 
 
 def run_systemd_tool(tool: str, args: Args, config: Config) -> None:
-    if config.output_format not in (OutputFormat.disk, OutputFormat.directory):
+    if config.output_format not in (OutputFormat.disk, OutputFormat.directory) and not config.forward_journal:
         die(f"{config.output_format} images cannot be inspected with {tool}")
 
     if (
         args.verb in (Verb.journalctl, Verb.coredumpctl)
         and config.output_format == OutputFormat.disk
+        and not config.forward_journal
         and os.getuid() != 0
     ):
         die(f"Must be root to run the {args.verb} command")
@@ -4042,21 +4150,30 @@ def run_systemd_tool(tool: str, args: Args, config: Config) -> None:
     if (tool_path := config.find_binary(tool)) is None:
         die(f"Failed to find {tool}")
 
-    if config.ephemeral:
+    if config.ephemeral and not config.forward_journal:
         die(f"Images booted in ephemeral mode cannot be inspected with {tool}")
 
-    image_arg_name = "root" if config.output_format == OutputFormat.directory else "image"
+    output = config.output_dir_or_cwd() / config.output
+
+    if config.forward_journal and not config.forward_journal.exists():
+        die(f"Journal directory/file configured with ForwardJournal= does not exist, cannot inspect with {tool}")
+    elif not output.exists():
+        die(f"Output {config.output_dir_or_cwd() / config.output} does not exist, cannot inspect with {tool}")
+
+    cmd: list[PathString] = [tool_path]
+
+    if config.forward_journal:
+        cmd += ["--directory" if config.forward_journal.is_dir() else "--file", config.forward_journal]
+    else:
+        cmd += ["--root" if output.is_dir() else "--image", output]
+
     run(
-        [
-            tool_path,
-            f"--{image_arg_name}={config.output_dir_or_cwd() / config.output}",
-            *args.cmdline
-        ],
+        [*cmd, *args.cmdline],
         stdin=sys.stdin,
         stdout=sys.stdout,
         env=os.environ | config.environment,
         log=False,
-        preexec_fn=become_root,
+        preexec_fn=become_root if not config.forward_journal else None,
         sandbox=config.sandbox(
             binary=tool_path,
             network=True,
@@ -4283,7 +4400,10 @@ def run_clean_scripts(config: Config) -> None:
     if config.profile:
         env["PROFILE"] = config.profile
 
-    with finalize_source_mounts(config, ephemeral=False) as sources:
+    with (
+        finalize_source_mounts(config, ephemeral=False) as sources,
+        finalize_config_json(config) as json,
+    ):
         for script in config.clean_scripts:
             with complete_step(f"Running clean script {script}…"):
                 run(
@@ -4295,6 +4415,7 @@ def run_clean_scripts(config: Config) -> None:
                         mounts=[
                             *sources,
                             Mount(script, "/work/clean", ro=True),
+                            Mount(json, "/work/config.json", ro=True),
                             *([Mount(o, "/work/out")] if (o := config.output_dir_or_cwd()).exists() else []),
                         ],
                         options=["--dir", "/work/src", "--chdir", "/work/src", "--dir", "/work/out"]
@@ -4518,6 +4639,14 @@ def run_verb(args: Args, images: Sequence[Config], *, resources: Path) -> None:
 
     if args.verb == Verb.bump:
         return bump_image_version()
+
+    if args.verb == Verb.dependencies:
+        _, [deps] = parse_config(["--directory", "", "--include=mkosi-tools", "build"], resources=resources)
+
+        for p in deps.packages:
+            print(p)
+
+        return
 
     if all(config == Config.default() for config in images):
         die("No configuration found",
