@@ -477,7 +477,7 @@ boolean argument: either `1`, `yes`, or `true` to enable, or `0`, `no`,
 :   The distribution to install in the image. Takes one of the following
     arguments: `fedora`, `debian`, `kali`, `ubuntu`, `arch`, `opensuse`,
     `mageia`, `centos`, `rhel`, `rhel-ubi`, `openmandriva`, `rocky`, `alma`,
-    `azure` or `custom`. If not specified, defaults to the distribution of
+    `azure`, `amazonlinux`, or `custom`. If not specified, defaults to the distribution of
     the host or `custom` if the distribution of the host is not a supported
     distribution.
 
@@ -525,6 +525,7 @@ boolean argument: either `1`, `yes`, or `true` to enable, or `0`, `no`,
     | `mageia`       | https://www.mageia.org            |                                |
     | `openmandriva` | http://mirrors.openmandriva.org   |                                |
     | `azure`        | https://packages.microsoft.com/   |                                |
+    | `amazonlinux`  | https://cdn.amazonlinux.com/      |                                |
 
 `Snapshot=`
 :   Download packages from the given snapshot instead of downloading the latest
@@ -2318,6 +2319,8 @@ distributions:
 * *Azure Linux*
 
 * *postmarketOS*
+
+* *Amazon Linux 2023*
 
 * *None* (**Requires the user to provide a pre-built rootfs**)
 
